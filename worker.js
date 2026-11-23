@@ -37,6 +37,18 @@ function rewriteCookie(cookie, originHost, proxyHost) {
   });
 }
 
+// גוף תגובה (JSON/HTML) שמכיל כתובות מוחלטות של המקור עובר להוסט הפרוקסי.
+// בלי זה, מטא־דאטה של OAuth (issuer, authorization/token/register, resource)
+// מצביעה על המקור ב־:1004, ולקוח MCP קפדן (ChatGPT) דוחה אותה כי ה־resource
+// לא תואם את ה־URL שהוא ביקש — והחיבור נכשל בשגיאת רישום OAuth.
+function rewriteBodyText(text, origin, proxyHost) {
+  const bare = origin.replace(/:\d+$/, "");
+  const proxyBase = "https://" + proxyHost;
+  let out = text.split(origin).join(proxyBase);
+  if (bare !== origin) out = out.split(bare).join(proxyBase);
+  return out;
+}
+
 export default {
   async fetch(request, env) {
     const target = new URL(env.TARGET_ORIGIN);
@@ -50,6 +62,9 @@ export default {
     for (const h of HOP_BY_HOP) headers.delete(h);
     headers.set("x-forwarded-host", proxyHost);
     headers.set("x-forwarded-proto", "https");
+    // בלי דחיסה מהמקור — גוף דחוס אי־אפשר לשכתב, ושכתוב הגוף נדרש
+    // למטא־דאטה של OAuth ולדפי ההתחברות/ההסכמה.
+    headers.set("accept-encoding", "identity");
 
     let originResponse;
     try {
@@ -74,6 +89,13 @@ export default {
         rewriteLocation(location, target.origin, proxyHost),
       );
     }
+    const wwwAuth = resHeaders.get("www-authenticate");
+    if (wwwAuth && wwwAuth.includes(target.origin)) {
+      resHeaders.set(
+        "www-authenticate",
+        rewriteBodyText(wwwAuth, target.origin, proxyHost),
+      );
+    }
     const cookies = originResponse.headers.getSetCookie
       ? originResponse.headers.getSetCookie()
       : [];
@@ -90,6 +112,30 @@ export default {
         statusText: originResponse.statusText,
         headers: resHeaders,
         webSocket: originResponse.webSocket,
+      });
+    }
+
+    // JSON/HTML לא־דחוס: שכתוב כתובות המקור להוסט הפרוקסי בגוף.
+    // SSE וסוגים אחרים עוברים כזרם, ללא שינוי.
+    const contentType = (resHeaders.get("content-type") || "").toLowerCase();
+    const contentEncoding = (
+      resHeaders.get("content-encoding") || ""
+    ).toLowerCase();
+    const isJsonOrHtml =
+      contentType.includes("application/json") ||
+      contentType.includes("text/html");
+    const isUncompressed = !contentEncoding || contentEncoding === "identity";
+    if (isJsonOrHtml && isUncompressed) {
+      const rewritten = rewriteBodyText(
+        await originResponse.text(),
+        target.origin,
+        proxyHost,
+      );
+      resHeaders.delete("content-length");
+      return new Response(rewritten, {
+        status: originResponse.status,
+        statusText: originResponse.statusText,
+        headers: resHeaders,
       });
     }
 
